@@ -28,6 +28,8 @@ type Emitter struct {
 	recoverer RecoveryListener
 	// Maximum listeners for debugging potential memory leaks.
 	maxListeners int
+	//
+	ottoVM *otto.Otto
 }
 
 // AddListener appends the listener argument to the event arguments slice
@@ -235,8 +237,9 @@ func (emitter *Emitter) Emit(event interface{}, arguments ...interface{}) *Emitt
 		var values []interface{}
 
 		for i := 0; i < len(arguments); i++ {
-			v, err := otto.ToValue(arguments[i])
+			v, err := emitter.ottoVM.ToValue(arguments[i])
 			if err != nil {
+				fmt.Println(err)
 				return emitter
 			}
 			values = append(values, v)
@@ -288,6 +291,11 @@ func (emitter *Emitter) SetMaxListeners(max int) *Emitter {
 	return emitter
 }
 
+func (emitter *Emitter) ResetOttoEvents() *Emitter {
+	emitter.ottoEvents = make(map[interface{}][]otto.Value)
+	return emitter
+}
+
 // NewEmitter returns a new Emitter object, defaulting the
 // number of maximum listeners per event to the DefaultMaxListeners
 // constant and initializing its events map.
@@ -295,7 +303,16 @@ func NewEmitter() (emitter *Emitter) {
 	emitter = new(Emitter)
 	emitter.Mutex = new(sync.Mutex)
 	emitter.events = make(map[interface{}][]reflect.Value)
+	emitter.maxListeners = DefaultMaxListeners
+	return
+}
+
+func NewEmitterOtto(vm *otto.Otto) (emitter *Emitter) {
+	emitter = new(Emitter)
+	emitter.Mutex = new(sync.Mutex)
+	emitter.events = make(map[interface{}][]reflect.Value)
 	emitter.ottoEvents = make(map[interface{}][]otto.Value)
+	emitter.ottoVM = vm
 	emitter.maxListeners = DefaultMaxListeners
 	return
 }
