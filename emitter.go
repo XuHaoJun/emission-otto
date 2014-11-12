@@ -4,6 +4,7 @@ package emission
 import (
 	"errors"
 	"fmt"
+	"github.com/robertkrimen/otto"
 	"os"
 	"reflect"
 	"sync"
@@ -21,7 +22,8 @@ type Emitter struct {
 	// Mutex to prevent race conditions within the Emitter.
 	*sync.Mutex
 	// Map of event to a slice of listener function's reflect Values.
-	events map[interface{}][]reflect.Value
+	events     map[interface{}][]reflect.Value
+	ottoEvents map[interface{}][]otto.Value
 	// Optional RecoveryListener to call when a panic occurs.
 	recoverer RecoveryListener
 	// Maximum listeners for debugging potential memory leaks.
@@ -39,8 +41,9 @@ func (emitter *Emitter) AddListener(event, listener interface{}) *Emitter {
 	defer emitter.Unlock()
 
 	fn := reflect.ValueOf(listener)
+	ottoFn, isOttoValue := listener.(otto.Value)
 
-	if reflect.Func != fn.Kind() {
+	if reflect.Func != fn.Kind() && isOttoValue && !ottoFn.IsFunction() {
 		if nil == emitter.recoverer {
 			panic(ErrNoneFunction)
 		} else {
@@ -53,7 +56,11 @@ func (emitter *Emitter) AddListener(event, listener interface{}) *Emitter {
 			"number of listeners of %d.\n", event, emitter.maxListeners)
 	}
 
-	emitter.events[event] = append(emitter.events[event], fn)
+	if isOttoValue {
+		emitter.ottoEvents[event] = append(emitter.ottoEvents[event], ottoFn)
+	} else {
+		emitter.events[event] = append(emitter.events[event], fn)
+	}
 
 	return emitter
 }
@@ -72,8 +79,9 @@ func (emitter *Emitter) RemoveListener(event, listener interface{}) *Emitter {
 	defer emitter.Unlock()
 
 	fn := reflect.ValueOf(listener)
+	ottoFn, isOttoValue := listener.(otto.Value)
 
-	if reflect.Func != fn.Kind() {
+	if reflect.Func != fn.Kind() && isOttoValue && !ottoFn.IsFunction() {
 		if nil == emitter.recoverer {
 			panic(ErrNoneFunction)
 		} else {
@@ -81,14 +89,27 @@ func (emitter *Emitter) RemoveListener(event, listener interface{}) *Emitter {
 		}
 	}
 
-	if events, ok := emitter.events[event]; ok {
-		for i, listener := range events {
-			if fn == listener {
-				// Do not break here to ensure the listener has not been
-				// added more than once.
-				emitter.events[event] = append(emitter.events[event][:i], emitter.events[event][i+1:]...)
+	if isOttoValue {
+		if events, ok := emitter.ottoEvents[event]; ok {
+			for i, listener := range events {
+				if ottoFn == listener {
+					// Do not break here to ensure the listener has not been
+					// added more than once.
+					emitter.ottoEvents[event] = append(emitter.ottoEvents[event][:i], emitter.ottoEvents[event][i+1:]...)
+				}
 			}
 		}
+	} else {
+		if events, ok := emitter.events[event]; ok {
+			for i, listener := range events {
+				if fn == listener {
+					// Do not break here to ensure the listener has not been
+					// added more than once.
+					emitter.events[event] = append(emitter.events[event][:i], emitter.events[event][i+1:]...)
+				}
+			}
+		}
+
 	}
 
 	return emitter
@@ -106,8 +127,9 @@ func (emitter *Emitter) Off(event, listener interface{}) *Emitter {
 // has been set then it is called after recovering from the panic.
 func (emitter *Emitter) Once(event, listener interface{}) *Emitter {
 	fn := reflect.ValueOf(listener)
+	ottoFn, isOttoValue := listener.(otto.Value)
 
-	if reflect.Func != fn.Kind() {
+	if reflect.Func != fn.Kind() && isOttoValue && !ottoFn.IsFunction() {
 		if nil == emitter.recoverer {
 			panic(ErrNoneFunction)
 		} else {
@@ -117,16 +139,24 @@ func (emitter *Emitter) Once(event, listener interface{}) *Emitter {
 
 	var run func(...interface{})
 
-	run = func(arguments ...interface{}) {
-		defer emitter.RemoveListener(event, run)
+	if isOttoValue {
+		run = func(arguments ...interface{}) {
+			defer emitter.RemoveListener(event, run)
 
-		var values []reflect.Value
-
-		for i := 0; i < len(arguments); i++ {
-			values = append(values, reflect.ValueOf(arguments[i]))
+			ottoFn.Call(otto.NullValue(), arguments...)
 		}
+	} else {
+		run = func(arguments ...interface{}) {
+			defer emitter.RemoveListener(event, run)
 
-		fn.Call(values)
+			var values []reflect.Value
+
+			for i := 0; i < len(arguments); i++ {
+				values = append(values, reflect.ValueOf(arguments[i]))
+			}
+
+			fn.Call(values)
+		}
 	}
 
 	emitter.AddListener(event, run)
@@ -141,15 +171,19 @@ func (emitter *Emitter) Once(event, listener interface{}) *Emitter {
 // the panic.
 func (emitter *Emitter) Emit(event interface{}, arguments ...interface{}) *Emitter {
 	var (
-		listeners []reflect.Value
-		ok        bool
+		listeners     []reflect.Value
+		ottoListeners []otto.Value
+		ok            bool
+		ottoOk        bool
 	)
 
 	// Lock the mutex when reading from the Emitter's
 	// events map.
 	emitter.Lock()
 
-	if listeners, ok = emitter.events[event]; !ok {
+	ottoListeners, ottoOk = emitter.ottoEvents[event]
+
+	if listeners, ok = emitter.events[event]; !ok && !ottoOk {
 		// If the Emitter does not include the event in its
 		// event map, it has no listeners to Call yet.
 		emitter.Unlock()
@@ -161,38 +195,76 @@ func (emitter *Emitter) Emit(event interface{}, arguments ...interface{}) *Emitt
 	// with Once can aquire the mutex for removal.
 	emitter.Unlock()
 
-	var (
-		wg     sync.WaitGroup
-		values []reflect.Value
-	)
+	var wg sync.WaitGroup
 
-	for i := 0; i < len(arguments); i++ {
-		values = append(values, reflect.ValueOf(arguments[i]))
+	if ok {
+		wg.Add(len(listeners))
+
+		var values []reflect.Value
+
+		for i := 0; i < len(arguments); i++ {
+			values = append(values, reflect.ValueOf(arguments[i]))
+		}
+
+		for _, fn := range listeners {
+			go func(fn reflect.Value) {
+				// Recover from potential panics, supplying them to a
+				// RecoveryListener if one has been set, else allowing
+				// the panic to occur.
+				if nil != emitter.recoverer {
+					defer func() {
+						if r := recover(); nil != r {
+							err := errors.New(fmt.Sprintf("%v", r))
+							emitter.recoverer(event, fn.Interface(), err)
+						}
+					}()
+				}
+
+				defer wg.Done()
+
+				fn.Call(values)
+			}(fn)
+		}
+
+		wg.Wait()
 	}
 
-	wg.Add(len(listeners))
+	if ottoOk {
+		wg.Add(len(ottoListeners))
 
-	for _, fn := range listeners {
-		go func(fn reflect.Value) {
-			// Recover from potential panics, supplying them to a
-			// RecoveryListener if one has been set, else allowing
-			// the panic to occur.
-			if nil != emitter.recoverer {
-				defer func() {
-					if r := recover(); nil != r {
-						err := errors.New(fmt.Sprintf("%v", r))
-						emitter.recoverer(event, fn.Interface(), err)
-					}
-				}()
+		var values []interface{}
+
+		for i := 0; i < len(arguments); i++ {
+			v, err := otto.ToValue(arguments[i])
+			if err != nil {
+				return emitter
 			}
+			values = append(values, v)
+		}
 
-			defer wg.Done()
+		for _, fn := range ottoListeners {
+			go func(fn otto.Value) {
+				// Recover from potential panics, supplying them to a
+				// RecoveryListener if one has been set, else allowing
+				// the panic to occur.
+				if nil != emitter.recoverer {
+					defer func() {
+						if r := recover(); nil != r {
+							err := errors.New(fmt.Sprintf("%v", r))
+							inter, _ := fn.Export()
+							emitter.recoverer(event, inter, err)
+						}
+					}()
+				}
 
-			fn.Call(values)
-		}(fn)
+				defer wg.Done()
+
+				fn.Call(otto.NullValue(), values...)
+			}(fn)
+		}
+
+		wg.Wait()
 	}
-
-	wg.Wait()
 	return emitter
 }
 
@@ -223,6 +295,7 @@ func NewEmitter() (emitter *Emitter) {
 	emitter = new(Emitter)
 	emitter.Mutex = new(sync.Mutex)
 	emitter.events = make(map[interface{}][]reflect.Value)
+	emitter.ottoEvents = make(map[interface{}][]otto.Value)
 	emitter.maxListeners = DefaultMaxListeners
 	return
 }
