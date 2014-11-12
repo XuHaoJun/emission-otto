@@ -232,8 +232,6 @@ func (emitter *Emitter) Emit(event interface{}, arguments ...interface{}) *Emitt
 	}
 
 	if ottoOk {
-		wg.Add(len(ottoListeners))
-
 		var values []interface{}
 
 		for i := 0; i < len(arguments); i++ {
@@ -246,27 +244,18 @@ func (emitter *Emitter) Emit(event interface{}, arguments ...interface{}) *Emitt
 		}
 
 		for _, fn := range ottoListeners {
-			go func(fn otto.Value) {
-				// Recover from potential panics, supplying them to a
-				// RecoveryListener if one has been set, else allowing
-				// the panic to occur.
-				if nil != emitter.recoverer {
-					defer func() {
-						if r := recover(); nil != r {
-							err := errors.New(fmt.Sprintf("%v", r))
-							inter, _ := fn.Export()
-							emitter.recoverer(event, inter, err)
-						}
-					}()
-				}
+			if nil != emitter.recoverer {
+				defer func() {
+					if r := recover(); nil != r {
+						err := errors.New(fmt.Sprintf("%v", r))
+						inter, _ := fn.Export()
+						emitter.recoverer(event, inter, err)
+					}
+				}()
+			}
 
-				defer wg.Done()
-
-				fn.Call(otto.NullValue(), values...)
-			}(fn)
+			fn.Call(otto.NullValue(), values...)
 		}
-
-		wg.Wait()
 	}
 	return emitter
 }
@@ -292,6 +281,9 @@ func (emitter *Emitter) SetMaxListeners(max int) *Emitter {
 }
 
 func (emitter *Emitter) ResetOttoEvents() *Emitter {
+	emitter.Lock()
+	defer emitter.Unlock()
+
 	emitter.ottoEvents = make(map[interface{}][]otto.Value)
 	return emitter
 }
