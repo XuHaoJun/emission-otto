@@ -72,6 +72,21 @@ func (emitter *Emitter) On(event, listener interface{}) *Emitter {
 	return emitter.AddListener(event, listener)
 }
 
+func (emitter *Emitter) JsOn(call otto.FunctionCall) otto.Value {
+	event := call.Argument(0)
+	listener := call.Argument(1)
+	e, err := event.Export()
+	if err != nil {
+		return otto.NullValue()
+	}
+	if event.IsString() {
+		e = e.(string)
+	}
+	emitter.AddListener(e, listener)
+	v, _ := emitter.ottoVM.ToValue(emitter)
+	return v
+}
+
 // RemoveListener removes the listener argument from the event arguments slice
 // in the Emitter's events map.  If the reflect Value of the listener does not
 // have a Kind of Func then RemoveListener panics. If a RecoveryListener has
